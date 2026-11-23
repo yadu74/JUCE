@@ -66,6 +66,34 @@
  #error "You need to define the JucePlugin_LV2URI value! If you're using the Projucer/CMake, the definition will be written into JuceLV2Defines.h automatically."
 #endif
 
+/*  Local extension (opt-in, off by default).
+
+    JUCE_LV2_EXPOSE_CONTROL_PORTS
+        When 1, every plugin parameter is additionally exposed as a standard float lv2:InputPort /
+        lv2:ControlPort. Hosts that only understand control ports (e.g. MOD / pi-Stomp, which can
+        only address control ports with MIDI CCs or hardware controls) can then see and bind the
+        parameters. The ports are appended after all of the existing ports, so the indices of the
+        pre-existing ports are unchanged. Default: 0, which generates exactly the same bundle and
+        behaves exactly as before.
+
+    JUCE_LV2_KEEP_PATCH_PARAMETERS
+        When 1 (the default) the lv2:Parameter / patch:writable / patch:readable description of the
+        parameters is kept. Set this to 0 (together with JUCE_LV2_EXPOSE_CONTROL_PORTS=1) to produce
+        a "control ports only" bundle, so that a host that understands both mechanisms does not show
+        each parameter twice. When 0, the plugin also stops sending patch:Set notifications.
+*/
+#ifndef JUCE_LV2_EXPOSE_CONTROL_PORTS
+ #define JUCE_LV2_EXPOSE_CONTROL_PORTS 0
+#endif
+
+#ifndef JUCE_LV2_KEEP_PATCH_PARAMETERS
+ #define JUCE_LV2_KEEP_PATCH_PARAMETERS 1
+#endif
+
+#if ! JUCE_LV2_EXPOSE_CONTROL_PORTS && ! JUCE_LV2_KEEP_PATCH_PARAMETERS
+ #error "JUCE_LV2_KEEP_PATCH_PARAMETERS=0 requires JUCE_LV2_EXPOSE_CONTROL_PORTS=1, otherwise no parameters would be exposed at all."
+#endif
+
 namespace juce::lv2_client
 {
 
@@ -172,7 +200,13 @@ public:
             return;
         }
 
-        if (auto* param = legacyParameters.getParamForIndex ((int) it->second))
+        setValueByIndex (it->second, value);
+    }
+
+    /*  Sets a parameter from a value in the parameter's real (not normalised) range. */
+    void setValueByIndex (size_t index, float value) noexcept
+    {
+        if (auto* param = legacyParameters.getParamForIndex ((int) index))
         {
             const auto scaledValue = [&]
             {
@@ -188,6 +222,11 @@ public:
                 param->setValueNotifyingHost (scaledValue);
             }
         }
+    }
+
+    int getNumParameters() const noexcept
+    {
+        return legacyParameters.getNumParameters();
     }
 
     struct Options
@@ -277,8 +316,8 @@ enum class PortKind { seqInput, seqOutput, latencyOutput, freeWheelingInput, ena
 
 struct PortIndices
 {
-    PortIndices (int numInputsIn, int numOutputsIn)
-        : numInputs (numInputsIn), numOutputs (numOutputsIn) {}
+    PortIndices (int numInputsIn, int numOutputsIn, int numParametersIn = 0)
+        : numInputs (numInputsIn), numOutputs (numOutputsIn), numParameters (numParametersIn) {}
 
     int getPortIndexForAudioInput (int audioIndex) const noexcept
     {
@@ -295,7 +334,26 @@ struct PortIndices
     // Audio ports are numbered from 0 to numInputs + numOutputs
     int getMaxAudioPortIndex() const noexcept { return numInputs + numOutputs; }
 
-    int numInputs, numOutputs;
+    // Optional parameter control ports (see JUCE_LV2_EXPOSE_CONTROL_PORTS) are placed after all of
+    // the PortKind ports, so the index of every other port is the same with or without them.
+    static constexpr int numPortKinds = (int) PortKind::enabledInput + 1;
+
+    int getPortIndexForParameter (int parameterIndex) const noexcept
+    {
+        return getMaxAudioPortIndex() + numPortKinds + parameterIndex;
+    }
+
+    int getParameterIndexForPort (int port) const noexcept
+    {
+        return port - getMaxAudioPortIndex() - numPortKinds;
+    }
+
+    bool isParameterPort (int port) const noexcept
+    {
+        return isPositiveAndBelow (getParameterIndexForPort (port), numParameters);
+    }
+
+    int numInputs, numOutputs, numParameters;
 };
 
 //==============================================================================
@@ -443,12 +501,13 @@ private:
 class Ports
 {
 public:
-    Ports (LV2_URID_Map map, int numInputsIn, int numOutputsIn)
+    Ports (LV2_URID_Map map, int numInputsIn, int numOutputsIn, int numParametersIn = 0)
         : forge (map),
-          indices (numInputsIn, numOutputsIn),
+          indices (numInputsIn, numOutputsIn, numParametersIn),
           mLV2_ATOM__Sequence (map.map (map.handle, LV2_ATOM__Sequence))
     {
         audioBuffers.resize (static_cast<size_t> (numInputsIn + numOutputsIn), nullptr);
+        parameterPorts.resize (static_cast<size_t> (numParametersIn), nullptr);
     }
 
     void connect (int port, void* data)
@@ -474,6 +533,10 @@ public:
         else if (port == indices.getPortIndexFor (PortKind::enabledInput))
         {
             enabled = static_cast<float*> (data);
+        }
+        else if (indices.isParameterPort (port))
+        {
+            parameterPorts[(size_t) indices.getParameterIndexForPort (port)] = static_cast<float*> (data);
         }
         else if (isPositiveAndBelow (port, indices.getMaxAudioPortIndex()))
         {
@@ -517,6 +580,17 @@ public:
         return audioBuffers[(size_t) indices.getPortIndexForAudioOutput (index)];
     }
 
+    int getNumParameterPorts() const noexcept
+    {
+        return (int) parameterPorts.size();
+    }
+
+    // May be null if the host has not connected the port
+    const float* getParameterPort (int parameterIndex) const noexcept
+    {
+        return parameterPorts[(size_t) parameterIndex];
+    }
+
     bool isFreeWheeling() const noexcept
     {
         if (freeWheeling != nullptr)
@@ -544,6 +618,7 @@ private:
     float* freeWheeling = nullptr;
     float* enabled = nullptr;
     std::vector<float*> audioBuffers;
+    std::vector<float*> parameterPorts;
     const LV2_URID mLV2_ATOM__Sequence;
 
     JUCE_LEAK_DETECTOR (Ports)
@@ -596,6 +671,49 @@ public:
         return count;
     }
 
+    /*  Applies the value of every parameter control port that changed since the previous cycle.
+
+        Only changes are applied (rather than re-applying every port value on every cycle), so
+        parameter changes made some other way, e.g. patch:Set messages, host state restoration or
+        the plugin's own editor, are not reverted by a stale port value.
+    */
+    void syncParameterPorts() noexcept
+    {
+        // A restored state (e.g. a session saved before the control ports existed) is authoritative
+        // for the parameters. The values the host holds on the ports at that point are not: for a
+        // port the host has never saved they are only defaults. Take them as the new baseline instead
+        // of applying them, so that only later changes are applied.
+        if (rebaselinePortValues.exchange (false))
+        {
+            for (auto i = 0; i < (int) lastParameterPortValues.size(); ++i)
+                if (const auto* port = ports.getParameterPort (i); port != nullptr && std::isfinite (*port))
+                    lastParameterPortValues[(size_t) i] = *port;
+
+            return;
+        }
+
+        for (auto i = 0; i < (int) lastParameterPortValues.size(); ++i)
+        {
+            const auto* port = ports.getParameterPort (i);
+
+            if (port == nullptr)
+                continue;
+
+            const auto value = *port;
+
+            if (! std::isfinite (value))
+                continue;
+
+            auto& last = lastParameterPortValues[(size_t) i];
+
+            if (std::isnan (last) || ! approximatelyEqual (value, last))
+            {
+                last = value;
+                parameters.setValueByIndex ((size_t) i, value);
+            }
+        }
+    }
+
     void run (uint32_t numSteps)
     {
         // If this is hit, the host is trying to process more samples than it told us to prepare
@@ -608,6 +726,11 @@ public:
         const ScopeGuard incrementPlayHead { [&] { playHead.incrementByNumSamples ((int) numSteps); } };
 
         audio.setSize (audio.getNumChannels(), static_cast<int> (numSteps), true, false, true);
+
+       #if JUCE_LV2_EXPOSE_CONTROL_PORTS
+        // Control ports first, so that an explicit patch:Set in the same cycle takes precedence
+        syncParameterPorts();
+       #endif
 
         ports.forEachInputEvent ([&] (const LV2_Atom_Event* event)
         {
@@ -688,6 +811,7 @@ public:
         auto* forge = ports.forge.get();
         lv2_shared::SequenceFrame sequence { forge, (uint32_t) 0 };
 
+       #if JUCE_LV2_KEEP_PATCH_PARAMETERS
         parameters.forEachChangedParameter ([&] (const AudioProcessorParameter& param,
                                                  LV2_URID paramUrid,
                                                  const ParameterStorage::Options& options)
@@ -723,6 +847,7 @@ public:
             if (options.gestureEnd)
                 sendTouched (false);
         });
+       #endif
 
         if (shouldSendStateChange.exchange (false))
         {
@@ -780,6 +905,7 @@ public:
         {
             const auto programIndex = readUnaligned<int32_t> (programData);
             processor->setCurrentProgram (programIndex);
+            rebaselinePortValues = true;
             return LV2_STATE_SUCCESS;
         }
 
@@ -796,6 +922,7 @@ public:
         MemoryBlock block;
         block.fromBase64Encoding (text);
         processor->setStateInformation (block.getData(), (int) block.getSize());
+        rebaselinePortValues = true;
 
         return LV2_STATE_SUCCESS;
     }
@@ -879,7 +1006,12 @@ private:
     ParameterStorage parameters { *processor, mapFeature };
     Ports ports { mapFeature,
                   processor->getTotalNumInputChannels(),
-                  processor->getTotalNumOutputChannels() };
+                  processor->getTotalNumOutputChannels(),
+                  JUCE_LV2_EXPOSE_CONTROL_PORTS ? parameters.getNumParameters() : 0 };
+    // NaN means "no value seen yet", so the first value the host provides is always applied
+    std::vector<float> lastParameterPortValues = std::vector<float> ((size_t) ports.getNumParameterPorts(),
+                                                                     std::numeric_limits<float>::quiet_NaN());
+    std::atomic<bool> rebaselinePortValues { false };
     lv2_shared::PatchSetHelper patchSetHelper { mapFeature, JucePlugin_LV2URI };
     PlayHead playHead;
     MidiBuffer midi;
@@ -1084,6 +1216,87 @@ private:
                     fn (group.second, *param);
     }
 
+   #if JUCE_LV2_EXPOSE_CONTROL_PORTS
+    static String makeParameterPortSymbol (const AudioProcessorParameter& param, std::set<String>& usedSymbols)
+    {
+        // An LV2 port symbol must be a valid C identifier, and unique within the plugin.
+        String symbol;
+
+        for (auto c : LegacyAudioParameter::getParamID (&param, false))
+            symbol += String::charToString (c < 128 && (CharacterFunctions::isLetterOrDigit (c) || c == '_') ? c : (juce_wchar) '_');
+
+        if (symbol.isEmpty() || CharacterFunctions::isDigit (symbol[0]))
+            symbol = "p_" + symbol;
+
+        const auto base = symbol;
+
+        for (auto counter = 2; ! usedSymbols.insert (symbol).second; ++counter)
+            symbol = base + "_" + String (counter);
+
+        return symbol;
+    }
+
+    template <typename Stream>
+    static void writeParameterPorts (Stream& os,
+                                     const LegacyAudioParametersWrapper& legacyParameters,
+                                     const PortIndices& indices)
+    {
+        std::set<String> usedSymbols { "in", "out", "latency", "freeWheeling", "enabled" };
+
+        for (const auto* param : legacyParameters)
+        {
+            const auto [defaultValue, min, max] = [&]
+            {
+                if (auto* rangedParam = dynamic_cast<const RangedAudioParameter*> (param))
+                {
+                    return std::tuple (rangedParam->convertFrom0to1 (rangedParam->getDefaultValue()),
+                                       rangedParam->getNormalisableRange().start,
+                                       rangedParam->getNormalisableRange().end);
+                }
+
+                return std::tuple (param->getDefaultValue(), 0.0f, 1.0f);
+            }();
+
+            const auto name = param->getName (1024).replace ("\\", "\\\\").replace ("\"", "\\\"");
+
+            os << " , [\n"
+                  "\t\ta lv2:InputPort , lv2:ControlPort ;\n"
+                  "\t\tlv2:index " << indices.getPortIndexForParameter (param->getParameterIndex()) << " ;\n"
+                  "\t\tlv2:symbol \"" << makeParameterPortSymbol (*param, usedSymbols) << "\" ;\n"
+                  "\t\tlv2:name \"" << name << "\" ;\n"
+                  "\t\tlv2:default " << defaultValue << " ;\n"
+                  "\t\tlv2:minimum " << min << " ;\n"
+                  "\t\tlv2:maximum " << max << " ;\n";
+
+            constexpr auto stepLimit = 1000;
+            const auto numSteps = param->getNumSteps();
+
+            if (param->isBoolean())
+            {
+                os << "\t\tlv2:portProperty lv2:toggled ;\n";
+            }
+            else if (param->isDiscrete() && 2 <= numSteps && numSteps < stepLimit)
+            {
+                os << "\t\tlv2:portProperty lv2:enumeration ;\n";
+
+                const auto strings = param->getAllValueStrings();
+
+                for (const auto [counter, string] : enumerate (strings))
+                {
+                    const auto value = jmap ((float) counter, 0.0f, (float) numSteps - 1.0f, min, max);
+
+                    os << "\t\tlv2:scalePoint [\n"
+                          "\t\t\trdfs:label \"" << string.replace ("\\", "\\\\").replace ("\"", "\\\"") << "\" ;\n"
+                          "\t\t\trdf:value " << value << " ;\n"
+                          "\t\t] ;\n";
+                }
+            }
+
+            os << "\t]";
+        }
+    }
+   #endif
+
     static Result writeDspTtl (AudioProcessor& proc, const File& libraryPath)
     {
         auto os = openStream (libraryPath, "dsp");
@@ -1119,6 +1332,7 @@ private:
         const auto allGroups = findAllSubgroupsDepthFirst (legacyParameters.getGroup());
         const auto groupsAndSymbols = getGroupsAndSymbols (allGroups);
 
+       #if JUCE_LV2_KEEP_PATCH_PARAMETERS
         const auto parameterVisitor = [&] (const String& symbol,
                                            const AudioProcessorParameter& param)
         {
@@ -1174,6 +1388,7 @@ private:
         };
 
         visitAllParameters (groupsAndSymbols, parameterVisitor);
+       #endif
 
         for (const auto& groupInfo : groupsAndSymbols)
         {
@@ -1268,6 +1483,7 @@ private:
                 os << "\tpg:" << kind << " plug:" << getBaseBusName (isInput) << "1 ;\n";
         }
 
+       #if JUCE_LV2_KEEP_PATCH_PARAMETERS
         if (legacyParameters.size() != 0)
         {
             for (const auto header : { "writable", "readable" })
@@ -1286,10 +1502,13 @@ private:
             }
         }
 
+       #endif
+
         os << "\tlv2:port [\n";
 
         const PortIndices indices (proc.getTotalNumInputChannels(),
-                                   proc.getTotalNumOutputChannels());
+                                   proc.getTotalNumOutputChannels(),
+                                   JUCE_LV2_EXPOSE_CONTROL_PORTS ? (int) legacyParameters.size() : 0);
 
         const auto designationMap = [&]
         {
@@ -1410,7 +1629,13 @@ private:
               "\t\tlv2:maximum 1.0 ;\n"
               "\t\tlv2:index " << indices.getPortIndexFor (PortKind::enabledInput) << " ;\n"
               "\t\tlv2:portProperty lv2:toggled , lv2:connectionOptional , pprop:notOnGUI ;\n"
-              "\t] ;\n"
+              "\t]";
+
+       #if JUCE_LV2_EXPOSE_CONTROL_PORTS
+        writeParameterPorts (os, legacyParameters, indices);
+       #endif
+
+        os << " ;\n"
               "\topts:supportedOption\n"
               "\t\tbufs:maxBlockLength .\n";
 
